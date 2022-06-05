@@ -1,0 +1,401 @@
+---
+title: "Hackathon - Raport z analizy danych"
+author: "Patryk Marek, Paweł Woźniak, Dominika Wójcik, Michał Koziński"
+date: "6/4/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(rio)
+library(flextable)
+library(gtsummary)
+library(psych)
+library(tables)
+library(kableExtra)
+library(plotrix)
+library(rstatix)
+library(ggstatsplot)
+library(leaps)
+library(lubridate)
+library(rsample)
+library(recipes)
+library(parsnip)
+library(yardstick)
+library(dials)
+library(tune)
+library(workflows)
+```
+
+```{r}
+train_test <- readRDS("dane_prob3.rds")
+vek <- c("m","rooms_num","terrain_area","build_year")
+train_test[vek] <- sapply(train_test[vek],as.numeric)
+train_test <- subset(train_test,train_test$m<800)
+train_test$district_name <- as.factor(train_test$district_name)
+train_test$city_name <- as.factor(train_test$city_name)
+train_test$region_id <- as.factor(train_test$region_id)
+cities <- read_csv("/home/patryk/Documents/DS/cities.csv")
+districts <- read_csv("/home/patryk/Documents/DS/districts.csv")
+test <- read_csv("/home/patryk/Documents/DS/test.csv")
+```
+
+
+# Cel badania
+
+Celem naszego badania jest znalezienie i przeanalizowanie czynników wpływających na ceny mieszkań w oparciu o dane Grupy OLX z portalu Otodom.pl oraz wyszukanie najczęściej pojawiających się schematów w wystawianych ofertach. Końcowym etapem naszego raportu jest wykonanie predykcji cen mieszkań w oparicu o dostarczone dane.
+
+# Opis zbioru badawczego
+
+W skład zbioru badawczego wchodzą cztery pliki:
+
+-   Cities - nazwy miast z położeniem geograficznym;
+
+-   Districts - nazwy dzielnic z położeniem geograficznym;
+
+-   Train - dane dotyczące ogłoszeń;
+
+-   Test - dane dotyczące ogłoszeń bez kolumny price (predykcja).
+
+```{r eval=FALSE, include=FALSE}
+train_test[colnames(train_test)!="description"&colnames(train_test)!="params"] %>% 
+  head() %>% 
+  kable(caption = "Przykładowe dane") %>% 
+  kable_styling(full_width = T, bootstrap_options  = "striped")
+```
+
+W zbiorze "Train" kluczową kolumną jest "params" zawierającą wszystkie uzupełnione opcje podczas wystawiania oferty na portalu. Ze względu na strukturę tej kolumny koniecznne było wycięcie z niej wszystkich parametrów i wpisanie ich w nowe pola dla każdego wiersza.
+
+Z całej populacji wybieramy losowo próbkę 100 tysięcy obserwacji.
+
+```{r}
+vek <- c("m","rooms_num","terrain_area","build_year")
+train_test[vek] <- sapply(train_test[vek],as.numeric)
+```
+
+Zbiór danych zawiera kilka wartości znacząco odstająco od reszty co widać na poniższym wykresie ramka-wąsy. Usuniemy je w celu zoptymalizowania dalszych obliczeń.
+
+```{r}
+train_test %>% 
+  ggplot(aes(y = price))+
+  geom_boxplot()
+```
+
+```{r}
+train_test <- subset(train_test, train_test$price<1000000)
+train_test %>% 
+  ggplot(aes(y = price))+
+  geom_boxplot()
+```
+
+```{r}
+corr <- rstatix::cor_mat(subset(train_test[c(vek,"price")]))
+corr_pval <- rstatix::cor_pmat(subset(train_test[c(vek,"price")]))
+ggcorrplot::ggcorrplot(corr,p.mat=corr_pval,lab=T)
+```
+
+Ze zmiennych numerycznych odrzucamy zmienną "build_year" ze względu na brak istotnej korelacji ze zmienną "price" oraz zmienną "terrain_area" ponieważ jest zbyt słabo skorelowana.
+
+Pozostałe zmienne będziemy testowali w naszym modelu.
+
+### Dane numeryczne
+
+Podstawowe statystyki opisowe dla zmiennych numerycznych:
+```{r}
+options(knitr.kable.NA=0)
+pods <- sub(".*:", "",summary(train_test[,c("price","rooms_num","m")])) 
+rownames(pods) <- c("Min.", "1st Qu.", "Median", "Mean", "3rd Qu.", "Max.","NA's")
+pods%>% kable() %>% kable_styling(full_width = T, bootstrap_options  = "striped")
+```
+
+### Dane typu kategorycznego
+
+Dla zmiennych kategorycznych prezentujemy ich możliwe poziomy, oraz liczby wystąpień każdego poziomu:
+
+```{r}
+options(knitr.kable.NA='')
+summary(train_test[,c("category","is_business","market","is_bungalow",
+                      "location","building_type","construction_status")]) %>% 
+  kable() %>% 
+  kable_styling(full_width = T, bootstrap_options  = "striped")
+```
+
+
+Te same dane w zestawieniu graficznym:
+
+```{r fig.show="hold", out.width="50%"}
+train_test %>% 
+  ggplot(aes(category, fill = category))+
+  geom_bar()+
+  xlab("")+
+  ylab("liczebność")
+
+train_test %>% 
+  ggplot(aes(is_business, fill = is_business))+
+  geom_bar()+
+  xlab("")+
+  ylab("liczebność")
+```
+
+# Regresja wieloraka - budowanie modelu
+
+```{r}
+data_subset <- train_test[ , c("m","is_business","city_name","district_name","market","building_type","construction_status","rooms_num","category","region_id")]
+data_by_column <- train_test[complete.cases(data_subset), ]
+```
+
+```{r}
+pod_train <- data_by_column[1:5000,]
+mod0 <- lm(price~1, data = pod_train)
+mod1 <- update(mod0, .~.+m, data = pod_train)
+anova(mod0, mod1)
+```
+
+```{r}
+summary(mod1)
+```
+
+```{r}
+mod2 <- update(mod1, .~.+rooms_num, data = pod_train)
+anova(mod1, mod2)
+```
+
+```{r}
+summary(mod2)
+```
+
+```{r}
+mod3 <- update(mod2, .~.+category)
+anova(mod2, mod3)
+```
+
+```{r}
+summary(mod3)
+```
+
+```{r}
+mod4 <- update(mod3, .~.+is_business, data = pod_train)
+summary(mod4)
+```
+
+Zmienna is_bussines nie jest istotna statystycznie.
+
+```{r}
+mod4 <- update(mod3, .~.-is_business, data = pod_train)
+mod5 <- update(mod4, .~.+market, data = pod_train)
+summary(mod5)
+```
+
+Zmienna market nie jest istotna statystycznie.
+
+```{r}
+mod5 <- update(mod4, .~.-market, data = pod_train)
+mod6 <- update(mod5, .~.+building_type, data = pod_train)
+summary(mod6)
+```
+
+Zmienna building_type nie jest istotna statystycznie.
+
+```{r}
+mod6 <- update(mod5, .~.-building_type, data = pod_train)
+mod7 <- update(mod6, .~.+city_name, data = pod_train)
+summary(mod7)
+```
+
+```{r}
+mod8 <- update(mod7, .~.+construction_status, data = pod_train)
+summary(mod8)
+```
+
+Zmienna construction_status nie jest istotna statystycznie, nie wnosi informacji do modelu.
+
+```{r}
+mod9 <- update(mod8, .~.-construction_status, data = pod_train)
+summary(mod9)
+```
+
+```{r}
+mod10 <- update(mod9, .~.-city_name, data = pod_train)
+summary(mod10)
+```
+
+
+Najlepszy model znaleziony metodą wstępującą:
+$$price  \sim m + rooms\_num + category $$
+
+```{r eval=FALSE, include=FALSE}
+mod_step <- step(lm(price~1, data=pod_train),
+                 scope = ~category+is_business+city_name+m+rooms_num+market+building_type,
+                 direction = "forward", test = "F")
+summary(mod_step)
+```
+
+```{r eval=FALSE, include=FALSE}
+predyk <- test[1:100,]
+
+paramsl <- predyk$params %>%
+  str_extract_all(.,pattern="br>.*?<=") %>%
+  rlist::list.ungroup() %>%
+  substr(.,4,nchar(.)-2) %>%
+  str_remove("<br>") %>%
+  unique()
+
+for (i in 1:length(paramsl)){
+  predyk <- cbind(predyk,NA)
+  colnames(predyk)[which(colnames(predyk)=="NA")] <- as.character(paramsl[i])
+    predyk[,ncol(predyk)] <- ifelse(str_detect(predyk$params,paste0(paramsl[i],'<=>')),
+           str_extract(predyk$params,paste0('(?<=',paramsl[i],'<=>)[^<]+')),
+           NA)
+}
+
+predict(mod_step,newdata = predyk) %>% 
+  summary()
+```
+
+```{r}
+zmiennosc <-  summary(mod6)$sigma/mean(pod_train$price)
+zmiennosc
+
+shapiro.test(mod6$residuals)
+
+nortest::lillie.test(mod6$residuals)
+
+hist(mod6$residuals, prob=T)
+curve(dnorm(x, mean=mean(mod6$residuals), sd=sd(mod6$residuals)), add=T, col='blue', lwd=2)
+
+plot(mod6)
+
+library(lmtest)
+raintest(mod6, order.by = ~fitted(mod6))
+```
+
+# Predykcja z wykorzysaniem lasu losowego
+
+```{r}
+data_split <- initial_split(train_test[1:1000,], prop = 0.7)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# ustawiamy przepis uczenia
+# w przypadku lasu losowego nie trzeba zmieniać zmiennych o charakterze jakościowym na dummy variables (w przeciwnieństwie np. do sieci neuronowych)
+train_test$floor_no <- as.factor(train_test$floor_no)
+train_test$extras_types <- as.factor(train_test$extras_types)
+
+rec <- recipe(price ~ m+rooms_num,
+              data = train_data) %>% 
+  step_normalize(all_numeric_predictors())
+
+## Ustawiamy model
+# wszystkie parametry modelu będą tuningowane, czyli poszukujemy najlepszych parametrów
+rf <- rand_forest(
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>% 
+  set_mode("regression") %>% 
+  set_engine("ranger", importance = "impurity")
+
+# ustawiamy potencjalne zakresy parametrów
+params <- extract_parameter_set_dials(rf)
+params <- finalize(params, train_data)
+
+# ustawiamy metodę resamplingu, czyli technikę oceny dopasowania modelu podczas uczenia na różnych zestawach parametrów
+rs <- vfold_cv(train_data, v = 5)
+
+# ustawiamy miary do oceny dopasowania modelu (R2, RMSE, MAE)
+meas <- metric_set(rsq, rmse, mae)
+
+# ustawiamy grid parametrów do uczenia, czyli kombinacje trzech paramtrów
+grid <- grid_latin_hypercube(params, size = 10)
+grid %>% 
+  flextable::flextable()
+```
+
+```{r}
+# ustawiamy workflow, czyli pojemnik, który zawiera zarówno przepis jak i model (nienauczony - póki co)
+rf_wf <- workflow() %>% 
+  add_recipe(rec) %>% 
+  add_model(rf)
+
+# uczymy model z wykorzystaniem różnych zestawów parametrów
+# do uczenia użyję paralelizacji, czyli więcej rdzeni będzie użytych
+
+# ponieważ ten etap trochę dlugo trwa, to zapisałem wynik tego uczenia na dysku i go wczytuje podczas kompilacji raportu
+
+#load("data/rf_res.rda")
+library(doParallel)
+registerDoParallel()
+ rf_res <-
+   rf_wf %>%
+   tune_grid(
+     resamples = rs,
+     grid = grid,
+     metrics = meas
+ )
+
+# wyniki uczenia
+rf_res %>% 
+  collect_metrics() %>% 
+  flextable::flextable()
+```
+
+```{r}
+rf_res %>% 
+  show_best(metric = "rsq")
+```
+
+```{r}
+rf_res %>% 
+  show_best(metric = "rmse")
+```
+
+```{r}
+rf_res %>% 
+  show_best(metric = "mae")
+```
+
+```{r}
+autoplot(rf_res)
+```
+
+```{r}
+rf_best_param <- select_best(rf_res, metric = "rmse")
+
+# finalizujemy workflow poprzez dodanie najlepszych parametrów do pudełka
+rf_final <- 
+  rf_wf %>% 
+  finalize_workflow(rf_best_param)
+
+## uczymy ostateczny model
+rf_fit <- rf_final %>% 
+  last_fit(data_split, metrics = meas)
+
+rf_fit %>% 
+  collect_metrics()
+```
+
+```{r}
+rf_fit %>% 
+  collect_predictions() %>% 
+  select(.pred, price) %>% 
+  ggplot(aes(.pred, price)) +
+  geom_jitter(width = 0, alpha = 0.05) +
+  geom_smooth(method = lm, 
+              se = F)
+```
+
+```{r}
+library(vip)
+rf_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+```
+
